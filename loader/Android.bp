@@ -102,8 +102,8 @@ cc_test {
     require_root: true,
 }
 
-rust_binary {
-    name: "bpfloader",
+rust_defaults {
+    name: "bpfloader_defaults",
     srcs: [
         "bpfloader.rs",
     ],
@@ -114,8 +114,20 @@ rust_binary {
         "libanyhow",
         "liblog_rust",
         "liblibbpf_rs",
+        "liblibbpf_sys",
         "liblibc",
     ],
+}
+
+rust_test {
+    name: "bpfloader_tests",
+    defaults: ["bpfloader_defaults"],
+    test_suites: ["general-tests"],
+}
+
+rust_binary {
+    name: "bpfloader",
+    defaults: ["bpfloader_defaults"],
     required: [
         "timeInState.bpf",
     ],

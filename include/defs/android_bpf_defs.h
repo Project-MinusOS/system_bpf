@@ -18,6 +18,7 @@
 #define __always_inline __attribute__((__always_inline__))
 
 #include <linux/bpf.h>
+#include <sys/cdefs.h>
 
 #define DEFINE_BPF_MAP_BASE(the_map, TYPE, KeyType, ValueType, num_entries, gid)               \
     struct {                                                                                   \
@@ -75,6 +76,11 @@
 
 #define LICENSE(NAME) char _license[] SEC("license") = (NAME)
 #define CRITICAL(NAME)
+
+// LLVM eBPF builtins: they directly generate BPF_LD_ABS/BPF_LD_IND (skb may be ignored?)
+unsigned long long load_byte(void* skb, unsigned long long off) asm("llvm.bpf.load.byte");
+unsigned long long load_half(void* skb, unsigned long long off) asm("llvm.bpf.load.half");
+unsigned long long load_word(void* skb, unsigned long long off) asm("llvm.bpf.load.word");
 
 #else  // LIBBPF DISABLED
 
