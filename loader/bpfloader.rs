@@ -16,18 +16,19 @@
 
 //! BPF loader for system and vendor applications
 
-use android_ids::{AID_MEDIA_RW, AID_ROOT, AID_SYSTEM};
+use android_ids::{AID_GRAPHICS, AID_MEDIA_RW, AID_ROOT, AID_SYSTEM};
 use android_logger::AndroidLogger;
 use anyhow::{anyhow, ensure};
 use libbpf_rs::{
     set_print, AsRawLibbpf, MapCore, ObjectBuilder, OpenObject, OpenProgramMut, PrintLevel,
     ProgramType,
 };
-use libbpf_sys::bpf_program__set_type;
+use libbpf_sys::{bpf_map__autocreate, bpf_program__set_type};
 use libc::{
     mode_t, uname, utsname, S_IRGRP, S_IRUSR, S_IRWXG, S_IRWXO, S_IRWXU, S_ISVTX, S_IWGRP, S_IWUSR,
 };
 use log::{debug, error, info, warn, Level, LevelFilter, Log, Metadata, Record, SetLoggerError};
+use rustutils::system_properties;
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
 use std::{
@@ -48,6 +49,8 @@ const fn kver(a: u32, b: u32, c: u32) -> u32 {
 
 const KVER_NONE: u32 = kver(0, 0, 0);
 const KVER_INF: u32 = 0xFFFFFFFF;
+const KVER_5_10: u32 = kver(5, 10, 0);
+const KVER_6_1: u32 = kver(6, 1, 0);
 
 enum KernelLevel {
     // Commented out unused due to rust complaining...
@@ -159,6 +162,10 @@ impl MapDesc {
     pub const fn new(group: u32, perms: mode_t, name: &'static str) -> Self {
         MapDesc { name, perms, owner: AID_ROOT, group, min_kver: KVER_NONE, max_kver: KVER_INF }
     }
+
+    pub const fn new_kver(group: u32, perms: mode_t, min_kver: u32, name: &'static str) -> Self {
+        MapDesc { name, perms, owner: AID_ROOT, group, min_kver, max_kver: KVER_INF }
+    }
 }
 
 struct ProgDesc {
@@ -174,6 +181,10 @@ impl ProgDesc {
     pub const fn new(group: u32, name: &'static str) -> Self {
         ProgDesc { name, owner: AID_ROOT, group, min_kver: KVER_NONE, max_kver: KVER_INF }
     }
+
+    pub const fn new_kver(group: u32, min_kver: u32, name: &'static str) -> Self {
+        ProgDesc { name, owner: AID_ROOT, group, min_kver, max_kver: KVER_INF }
+    }
 }
 
 struct BpfFileDesc {
@@ -185,6 +196,8 @@ struct BpfFileDesc {
     // Warning: setting this to 'true' will cause the system to boot loop if there are any issues
     // loading the bpf program.
     critical: bool,
+    // If this is true, maps and programs in the bpf object file are not loaded.
+    skip_on_user: bool,
     maps: &'static [MapDesc],
     progs: &'static [ProgDesc],
 }
@@ -194,7 +207,9 @@ const PERM_GRO: mode_t = S_IRUSR | S_IWUSR | S_IRGRP;
 const PERM_GWO: mode_t = S_IRUSR | S_IWUSR | S_IWGRP;
 const PERM_UGR: mode_t = S_IRUSR | S_IRGRP;
 
+const GID_ROOT: u32 = AID_ROOT;
 const GID_SYSTEM: u32 = AID_SYSTEM;
+const GID_GRAPHICS: u32 = AID_GRAPHICS;
 const GID_MEDIA_RW: u32 = AID_MEDIA_RW;
 
 const FILE_ARR: &[BpfFileDesc] = &[
@@ -203,6 +218,7 @@ const FILE_ARR: &[BpfFileDesc] = &[
         dir: "/etc/bpf/",
         prefix: "",
         critical: false,
+        skip_on_user: false,
         maps: &[
             MapDesc::new(GID_SYSTEM, PERM_GWO, "cpu_last_pid_map"),
             MapDesc::new(GID_SYSTEM, PERM_GWO, "cpu_last_update_map"),
@@ -231,8 +247,110 @@ const FILE_ARR: &[BpfFileDesc] = &[
         dir: "/etc/bpf/",
         prefix: "",
         critical: false,
+        skip_on_user: false,
         maps: &[],
         progs: &[ProgDesc::new(GID_MEDIA_RW, "fuse_media")],
+    },
+    BpfFileDesc {
+        filename: "gpuMem.bpf",
+        dir: "/etc/bpf/",
+        prefix: "",
+        critical: false,
+        skip_on_user: false,
+        maps: &[MapDesc::new(GID_MEDIA_RW, PERM_GRO, "gpu_mem_total_map")],
+        progs: &[ProgDesc::new(GID_GRAPHICS, "tracepoint_gpu_mem_gpu_mem_total")],
+    },
+    BpfFileDesc {
+        filename: "gpuWork.bpf",
+        dir: "/etc/bpf/",
+        prefix: "",
+        critical: false,
+        skip_on_user: false,
+        maps: &[
+            MapDesc::new(GID_GRAPHICS, PERM_GRW, "gpu_work_map"),
+            MapDesc::new(GID_GRAPHICS, PERM_GRW, "gpu_work_global_data"),
+        ],
+        progs: &[ProgDesc::new(GID_GRAPHICS, "tracepoint_power_gpu_work_period")],
+    },
+    BpfFileDesc {
+        filename: "bpfMemEvents.bpf",
+        dir: "/etc/bpf/memevents/",
+        prefix: "memevents/",
+        critical: false,
+        skip_on_user: false,
+        maps: &[
+            MapDesc::new_kver(GID_SYSTEM, PERM_GRW, KVER_5_10, "ams_rb"),
+            MapDesc::new_kver(GID_SYSTEM, PERM_GRW, KVER_5_10, "lmkd_rb"),
+        ],
+        progs: &[
+            ProgDesc::new_kver(GID_SYSTEM, KVER_5_10, "tracepoint_oom_mark_victim_ams"),
+            ProgDesc::new_kver(
+                GID_SYSTEM,
+                KVER_5_10,
+                "tracepoint_vmscan_mm_vmscan_direct_reclaim_begin_lmkd",
+            ),
+            ProgDesc::new_kver(
+                GID_SYSTEM,
+                KVER_5_10,
+                "tracepoint_vmscan_mm_vmscan_direct_reclaim_end_lmkd",
+            ),
+            ProgDesc::new_kver(
+                GID_SYSTEM,
+                KVER_5_10,
+                "tracepoint_vmscan_mm_vmscan_kswapd_wake_lmkd",
+            ),
+            ProgDesc::new_kver(
+                GID_SYSTEM,
+                KVER_5_10,
+                "tracepoint_vmscan_mm_vmscan_kswapd_sleep_lmkd",
+            ),
+            ProgDesc::new_kver(
+                GID_SYSTEM,
+                KVER_6_1,
+                "tracepoint_android_vendor_lmk_android_trigger_vendor_lmk_kill_lmkd",
+            ),
+            ProgDesc::new_kver(
+                GID_SYSTEM,
+                KVER_6_1,
+                "tracepoint_kmem_mm_calculate_totalreserve_pages_lmkd",
+            ),
+        ],
+    },
+    BpfFileDesc {
+        filename: "bpfMemEventsTest.bpf",
+        dir: "/etc/bpf/memevents/",
+        prefix: "memevents/",
+        critical: false,
+        skip_on_user: false,
+        maps: &[MapDesc::new_kver(GID_SYSTEM, PERM_GRW, KVER_5_10, "rb")],
+        progs: &[
+            ProgDesc::new_kver(GID_SYSTEM, KVER_5_10, "tracepoint_oom_mark_victim"),
+            ProgDesc::new_kver(GID_ROOT, KVER_5_10, "skfilter_oom_kill"),
+            ProgDesc::new_kver(GID_ROOT, KVER_5_10, "skfilter_direct_reclaim_begin"),
+            ProgDesc::new_kver(GID_ROOT, KVER_5_10, "skfilter_direct_reclaim_end"),
+            ProgDesc::new_kver(GID_ROOT, KVER_5_10, "skfilter_kswapd_wake"),
+            ProgDesc::new_kver(GID_ROOT, KVER_5_10, "skfilter_kswapd_sleep"),
+            ProgDesc::new_kver(GID_SYSTEM, KVER_6_1, "skfilter_android_trigger_vendor_lmk_kill"),
+            ProgDesc::new_kver(GID_ROOT, KVER_6_1, "skfilter_calculate_totalreserve_pages"),
+        ],
+    },
+    BpfFileDesc {
+        filename: "bpfRingbufProg.bpf",
+        dir: "/etc/bpf/",
+        prefix: "",
+        critical: true,
+        skip_on_user: true,
+        maps: &[MapDesc::new_kver(GID_ROOT, PERM_GRW, KVER_5_10, "test_ringbuf")],
+        progs: &[ProgDesc::new_kver(GID_ROOT, KVER_5_10, "skfilter_ringbuf_test")],
+    },
+    BpfFileDesc {
+        filename: "filterPowerSupplyEvents.bpf",
+        dir: "vendor/etc/bpf/",
+        prefix: "vendor/",
+        critical: true,
+        skip_on_user: false,
+        maps: &[],
+        progs: &[ProgDesc::new_kver(GID_SYSTEM, KVER_5_10, "skfilter_power_supply")],
     },
 ];
 
@@ -325,8 +443,63 @@ fn kernel_version() -> Result<u32, anyhow::Error> {
     Ok(kver(major, minor, sub))
 }
 
+fn set_skip_loading(
+    open_file: &mut OpenObject,
+    file_desc: &BpfFileDesc,
+) -> Result<(), anyhow::Error> {
+    let kvers = kernel_version()?;
+
+    for mut map in open_file.maps_mut() {
+        let name =
+            map.name().to_str().ok_or_else(|| anyhow!("Failed to parse map name into UTF-8"))?;
+        for map_desc in file_desc.maps {
+            if map_desc.name == name {
+                if kvers < map_desc.min_kver || kvers >= map_desc.max_kver {
+                    info!(
+                        "skipping map {} min_kver:{:x} max_kver:{:x} kvers:{:x}",
+                        name, map_desc.min_kver, map_desc.max_kver, kvers
+                    );
+                    map.set_autocreate(false)?;
+                }
+                break;
+            }
+        }
+    }
+
+    for mut prog in open_file.progs_mut() {
+        let name =
+            prog.name().to_str().ok_or_else(|| anyhow!("Failed to parse prog name into UTF-8"))?;
+        for prog_desc in file_desc.progs {
+            if prog_desc.name == name {
+                if kvers < prog_desc.min_kver || kvers >= prog_desc.max_kver {
+                    info!(
+                        "skipping program {} min_kver:{:x} max_kver:{:x} kvers:{:x}",
+                        name, prog_desc.min_kver, prog_desc.max_kver, kvers
+                    );
+                    prog.set_autoload(false);
+                }
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_user_build() -> Result<bool, anyhow::Error> {
+    if let Some(build_string) = system_properties::read("ro.build.type")? {
+        Ok(build_string == "user")
+    } else {
+        Ok(false)
+    }
+}
+
 fn libbpf_worker(file_desc: &BpfFileDesc) -> Result<(), anyhow::Error> {
     info!("Loading {}", file_desc.filename);
+    if file_desc.skip_on_user && is_user_build()? {
+        info!("Skip loading {} on user build", file_desc.filename);
+        return Ok(());
+    }
     let filepath = Path::new(file_desc.dir).join(file_desc.filename);
     // TODO: Make this error once the BPF loader migration completes.
     if !filepath.exists() {
@@ -342,12 +515,11 @@ fn libbpf_worker(file_desc: &BpfFileDesc) -> Result<(), anyhow::Error> {
     // libbpf's open_file attempts to infer the prog type based on the section name. But, some
     // section names are not recognized, so the program type must be set explicitly for them.
     set_prog_types(&mut open_file)?;
+    set_skip_loading(&mut open_file, file_desc)?;
     let mut loaded_file = open_file.load()?;
 
     let bpffs_path = "/sys/fs/bpf/".to_owned() + file_desc.prefix;
     create_dir(Path::new(&bpffs_path))?;
-
-    let kvers = kernel_version()?;
 
     for mut map in loaded_file.maps_mut() {
         let mut desc_found = false;
@@ -361,13 +533,13 @@ fn libbpf_worker(file_desc: &BpfFileDesc) -> Result<(), anyhow::Error> {
         for map_desc in file_desc.maps {
             if map_desc.name == name {
                 desc_found = true;
-                if kvers < map_desc.min_kver || kvers >= map_desc.max_kver {
-                    info!(
-                        "skipping map {} min_kver:{:x} max_kver:{:x} kvers:{:x}",
-                        name, map_desc.min_kver, map_desc.max_kver, kvers
-                    );
+                // SAFETY: bpf_map__autocreate just returns the field value of libbpf struct
+                let autocreate = unsafe { bpf_map__autocreate(map.as_libbpf_object().as_ptr()) };
+                if !autocreate {
+                    // This map is not loaded
                     continue;
                 }
+
                 let pinpath_str = bpffs_path.clone() + "map_" + filename + "_" + &name;
                 let pinpath = Path::new(&pinpath_str);
                 debug!("Pinning: {}", pinpath.display());
@@ -403,11 +575,8 @@ fn libbpf_worker(file_desc: &BpfFileDesc) -> Result<(), anyhow::Error> {
         for prog_desc in file_desc.progs {
             if prog_desc.name == name {
                 desc_found = true;
-                if kvers < prog_desc.min_kver || kvers >= prog_desc.max_kver {
-                    info!(
-                        "skipping program {} min_kver:{:x} max_kver:{:x} kvers:{:x}",
-                        name, prog_desc.min_kver, prog_desc.max_kver, kvers
-                    );
+                if !prog.autoload() {
+                    // This program is not loaded
                     continue;
                 }
                 let pinpath_str = bpffs_path.clone() + "prog_" + filename + "_" + &name;
